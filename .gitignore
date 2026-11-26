@@ -1,0 +1,32 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Google Drive OAuth credentials & tokens
+credentials.json
+token.json
+worker/credentials.json
+worker/token.json
+
+# Audit & temporary outputs
+audit_report.json
+worker/tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+worker/.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+[project]
+name = "pcc-ai-worker"
+version = "0.1.0"
+description = "Google Drive OAuth2 sync, audit, and document/Excel ingestion worker for PCC AI Assistant"
+requires-python = ">=3.11"
+dependencies = [
+    "google-api-python-client>=2.150.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.1",
+    "pandas>=2.2.0",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2.0",
+    "pydantic-settings>=2.6.0",
+    "pymupdf>=1.24.0",
+    "python-calamine>=0.3.0",
+    "python-docx>=1.1.2",
+    "python-dotenv>=1.0.1",
+    "rich>=13.9.0",
+]
+
+[tool.uv]
+package = false
