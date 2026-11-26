@@ -69,7 +69,13 @@ class DriveClient:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     str(self.credentials_path), SCOPES
                 )
-                creds = flow.run_local_server(port=0)
+                creds = flow.run_local_server(
+                    port=0,
+                    open_browser=True,
+                    authorization_prompt_message=(
+                        "Please open this URL in your browser to authorize Google Drive:\n{url}\n"
+                    ),
+                )
 
             self.token_path.parent.mkdir(parents=True, exist_ok=True)
             self.token_path.write_text(creds.to_json(), encoding="utf-8")

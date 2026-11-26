@@ -1,5 +1,7 @@
 -- 001_initial_schema.sql
 -- Hybrid RAG + Structured Excel SQL schema for Supabase PostgreSQL
+-- Uses pgvector halfvec(768) (requires pgvector >= 0.7.0, standard on Supabase)
+-- to cut vector and HNSW index storage by ~50% with negligible recall impact.
 
 create extension if not exists pgcrypto;
 create extension if not exists vector;
@@ -51,7 +53,7 @@ create table if not exists public.document_chunks (
     page_number int,
     section_heading text,
     content text not null,
-    embedding vector(768),
+    embedding halfvec(768),
     tsv tsvector generated always as (
         to_tsvector('english', coalesce(section_heading, '') || ' ' || content)
     ) stored,
@@ -64,7 +66,7 @@ create index if not exists idx_document_chunks_file_id
 create index if not exists idx_document_chunks_tsv
     on public.document_chunks using gin (tsv);
 create index if not exists idx_document_chunks_embedding_hnsw
-    on public.document_chunks using hnsw (embedding vector_cosine_ops);
+    on public.document_chunks using hnsw (embedding halfvec_cosine_ops);
 
 -- ============================================================================
 -- 4. Spreadsheet Catalog (Excel / CSV / Google Sheets)
@@ -79,7 +81,7 @@ create table if not exists public.spreadsheet_catalog (
     columns_json jsonb not null default '[]'::jsonb,
     sample_rows_json jsonb not null default '[]'::jsonb,
     summary_text text not null default '',
-    embedding vector(768),
+    embedding halfvec(768),
     web_view_link text,
     updated_at timestamptz default now()
 );
@@ -87,14 +89,14 @@ create table if not exists public.spreadsheet_catalog (
 create index if not exists idx_spreadsheet_catalog_file_id
     on public.spreadsheet_catalog (file_id);
 create index if not exists idx_spreadsheet_catalog_embedding_hnsw
-    on public.spreadsheet_catalog using hnsw (embedding vector_cosine_ops);
+    on public.spreadsheet_catalog using hnsw (embedding halfvec_cosine_ops);
 
 -- ============================================================================
 -- 5. Hybrid Document Search RPC (pgvector + tsvector Reciprocal Rank Fusion)
 -- ============================================================================
 create or replace function public.hybrid_search_documents(
     query_text text,
-    query_embedding vector(768),
+    query_embedding halfvec(768),
     match_count int default 6,
     folder_filter text default null,
     file_type_filter text default null,
@@ -186,7 +188,7 @@ $$;
 -- ============================================================================
 create or replace function public.search_spreadsheets(
     query_text text,
-    query_embedding vector(768),
+    query_embedding halfvec(768),
     match_count int default 5
 )
 returns table (

@@ -161,6 +161,8 @@ def main() -> int:
     )
 
     console.print(f"[bold]Auditing Google Drive folder:[/bold] {folder_id}")
+    console.print("Authorizing Google Drive access...")
+    client.authenticate()
     records: list[DriveFileRecord] = []
     with console.status("Scanning Google Drive folders recursively..."):
         for rec in client.iter_folder_files(folder_id):
