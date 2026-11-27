@@ -206,6 +206,74 @@ class DriveClient:
         data = buffer.getvalue()
         return data[:max_bytes] if max_bytes is not None else data
 
+    def export_bytes(self, file_id: str, export_mime_type: str) -> bytes:
+        """Export a native Google Workspace file (Docs/Sheets) to target MIME type."""
+        service = self.authenticate()
+        request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request, chunksize=4 * 1024 * 1024)
+
+        done = False
+        while not done:
+            _, done = self._execute_with_backoff(downloader.next_chunk)
+
+        return buffer.getvalue()
+
+    def resolve_folder_path(
+        self,
+        parents: list[str] | None,
+        root_folder_id: str,
+        cache: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """Walk parent chain upward; return '/Root/...' if under root_folder_id else None."""
+        if not parents:
+            return None
+
+        service = self.authenticate()
+        if root_folder_id not in cache:
+            root_meta = self.get_folder_metadata(root_folder_id)
+            cache[root_folder_id] = {
+                "name": root_meta.get("name", "DriveRoot"),
+                "parents": [],
+            }
+
+        for parent_id in parents:
+            chain: list[str] = []
+            current: str | None = parent_id
+            seen: set[str] = set()
+
+            while current and current not in seen:
+                seen.add(current)
+                if current == root_folder_id:
+                    root_name = cache[root_folder_id]["name"]
+                    suffix = "/".join(reversed(chain))
+                    return f"/{root_name}/{suffix}" if suffix else f"/{root_name}"
+
+                if current not in cache:
+                    meta = self._execute_with_backoff(
+                        lambda cid=current: service.files()
+                        .get(
+                            fileId=cid,
+                            fields="id, name, parents, trashed",
+                            supportsAllDrives=True,
+                        )
+                        .execute()
+                    )
+                    cache[current] = {
+                        "name": meta.get("name", "Folder"),
+                        "parents": meta.get("parents") or [],
+                        "trashed": bool(meta.get("trashed")),
+                    }
+
+                info = cache[current]
+                if info.get("trashed"):
+                    break
+                chain.append(info["name"])
+                next_parents = info.get("parents") or []
+                current = next_parents[0] if next_parents else None
+
+        return None
+
     def get_start_page_token(self) -> str:
         """Return initial Drive changes startPageToken for incremental sync."""
         service = self.authenticate()

@@ -274,22 +274,22 @@ begin
     end if;
 
     -- Require SELECT or WITH CTE
-    if cleaned_sql !~* '^(select|with)\b' then
+    if cleaned_sql !~* '^(select|with)\y' then
         raise exception 'Only SELECT or WITH queries are permitted';
     end if;
 
     -- Block DDL, DML, and administrative statements
-    if cleaned_sql ~* '\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|execute|call|do|set|reset|vacuum|analyze|lock)\b' then
+    if cleaned_sql ~* '\y(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|execute|call|do|set|reset|vacuum|analyze|lock)\y' then
         raise exception 'Disallowed SQL keyword detected';
     end if;
 
     -- Block access to system catalogs or non-excel schemas
-    if cleaned_sql ~* '\b(pg_catalog|pg_tables|pg_roles|pg_stat|information_schema|auth\.|storage\.|public\.)' then
+    if cleaned_sql ~* '\y(pg_catalog|pg_tables|pg_roles|pg_stat|information_schema|auth\.|storage\.|public\.)' then
         raise exception 'Access to system or non-excel_data schemas is forbidden';
     end if;
 
     -- Require explicit excel_data schema qualification
-    if cleaned_sql !~* '\bexcel_data\.' then
+    if cleaned_sql !~* '\yexcel_data\.' then
         raise exception 'Queries must target tables in the excel_data schema';
     end if;
 
