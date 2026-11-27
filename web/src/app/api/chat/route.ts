@@ -23,13 +23,15 @@ export async function POST(request: Request) {
 
   const model = getLanguageModel(body.modelId ?? DEFAULT_MODEL_ID);
   const tools = createAssistantTools();
+  const recentMessages = body.messages.slice(-8);
 
   const result = streamText({
     model,
     system: SYSTEM_PROMPT,
-    messages: body.messages,
+    messages: recentMessages,
     tools,
-    maxSteps: 8,
+    maxSteps: 6,
+    maxRetries: 1,
     temperature: 0.1,
   });
 

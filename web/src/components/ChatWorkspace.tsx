@@ -357,8 +357,9 @@ export function ChatWorkspace({ userEmail }: { userEmail: string }) {
 
             {error && (
               <div className="rounded-xl border border-red-500/40 bg-red-950/40 px-4 py-3 text-xs text-red-300">
-                Error: {error.message}. Try switching to Gemini 3.8 Flash in the
-                top-right menu if Groq hit a rate limit.
+                Error: {error.message}. If Groq hit its free 1-minute token
+                limit, wait ~10 seconds or switch to another Groq model in the
+                top-right dropdown.
               </div>
             )}
           </div>
