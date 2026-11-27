@@ -13,6 +13,8 @@ from typing import Any
 import pandas as pd
 from python_calamine import CalamineWorkbook
 
+from app.parsers.chunker import DocumentChunk, chunk_text
+
 
 @dataclass(slots=True)
 class ParsedSheet:
@@ -338,3 +340,39 @@ def parse_spreadsheet_bytes(
             parsed_sheets.append(sheet)
 
     return parsed_sheets
+
+
+def sheet_to_document_chunks(
+    sheet: ParsedSheet,
+    file_name: str,
+    start_index: int = 0,
+) -> list[DocumentChunk]:
+    """Serialize a small/narrative Excel worksheet into text chunks for document search."""
+    header_map = {c["name"]: c["original_header"] for c in sheet.columns_meta}
+    lines: list[str] = [
+        f"Spreadsheet: {file_name} | Sheet: {sheet.sheet_name} | Rows: {sheet.row_count}"
+    ]
+
+    for row_num, (_, row) in enumerate(sheet.dataframe.iterrows(), start=1):
+        parts: list[str] = []
+        for col in sheet.dataframe.columns:
+            val = _json_safe(row[col])
+            if val is None or str(val).strip() == "":
+                continue
+            label = header_map.get(col, col)
+            parts.append(f"{label}: {val}")
+        if parts:
+            lines.append(f"Row {row_num}: " + " | ".join(parts))
+
+    full_text = "\n".join(lines)
+    pieces = chunk_text(full_text, max_chars=1600, overlap=150)
+    section = f"Sheet: {sheet.sheet_name}"
+    return [
+        DocumentChunk(
+            chunk_index=start_index + idx,
+            page_number=None,
+            section_heading=section,
+            content=piece,
+        )
+        for idx, piece in enumerate(pieces)
+    ]

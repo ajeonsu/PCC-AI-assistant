@@ -19,63 +19,51 @@ function formatColumns(colsJson: unknown): string {
     .join(", ");
 }
 
-export async function execSearchDocuments(args: {
+export async function execSearchKnowledge(args: {
   query: string;
   fileType?: string;
 }) {
   const supabase = createAdminClient();
   const queryEmbedding = await embedQuery(args.query);
-  const { data, error } = await supabase.rpc("hybrid_search_documents", {
-    query_text: args.query,
-    query_embedding: queryEmbedding,
-    match_count: 4,
-    folder_filter: null,
-    file_type_filter: args.fileType ?? null,
-  });
 
-  if (error) {
-    return { error: error.message, results: [] };
-  }
-  const results = ((data ?? []) as Array<Record<string, unknown>>).map(
-    (r) => ({
-      file: r.file_name,
-      page: r.page_number,
-      heading: r.section_heading,
-      url: r.web_view_link,
-      content: truncateText(r.content, 1000),
+  const [docsRes, sheetsRes] = await Promise.all([
+    supabase.rpc("hybrid_search_documents", {
+      query_text: args.query,
+      query_embedding: queryEmbedding,
+      match_count: 5,
+      folder_filter: null,
+      file_type_filter: args.fileType ?? null,
     }),
-  );
-  return { results };
-}
+    supabase.rpc("search_spreadsheets", {
+      query_text: args.query,
+      query_embedding: queryEmbedding,
+      match_count: 15,
+    }),
+  ]);
 
-export async function execSearchSpreadsheets(args: { query: string }) {
-  const supabase = createAdminClient();
-  const queryEmbedding = await embedQuery(args.query);
-  const { data, error } = await supabase.rpc("search_spreadsheets", {
-    query_text: args.query,
-    query_embedding: queryEmbedding,
-    match_count: 15,
-  });
+  const documents = (
+    (docsRes.data ?? []) as Array<Record<string, unknown>>
+  ).map((r) => ({
+    file: r.file_name,
+    page: r.page_number,
+    heading: r.section_heading,
+    url: r.web_view_link,
+    content: truncateText(r.content, 1100),
+  }));
 
-  if (error) {
-    return { error: error.message, spreadsheets: [], sampleRows: {} };
-  }
-
-  const rawRows = (data ?? []) as Array<Record<string, unknown>>;
-
-  // Keep at most 2 sheets per file so multi-sheet workbooks don't crowd out other files.
+  const rawSheets = (sheetsRes.data ?? []) as Array<Record<string, unknown>>;
   const perFileCount = new Map<string, number>();
-  const diverseRows: Array<Record<string, unknown>> = [];
-  for (const row of rawRows) {
+  const diverseSheets: Array<Record<string, unknown>> = [];
+  for (const row of rawSheets) {
     const fileName = String(row.file_name ?? "");
     const count = perFileCount.get(fileName) ?? 0;
     if (count >= 2) continue;
     perFileCount.set(fileName, count + 1);
-    diverseRows.push(row);
-    if (diverseRows.length >= 6) break;
+    diverseSheets.push(row);
+    if (diverseSheets.length >= 6) break;
   }
 
-  const spreadsheets = diverseRows.map((s) => ({
+  const spreadsheets = diverseSheets.map((s) => ({
     file: s.file_name,
     sheet: s.sheet_name,
     table: s.sql_table_name,
@@ -84,7 +72,6 @@ export async function execSearchSpreadsheets(args: { query: string }) {
     cols: formatColumns(s.columns_json),
   }));
 
-  // Fetch 1 truncated sample row for the top 2 distinct tables.
   const sampleRows: Record<string, Record<string, unknown>> = {};
   const topTables = spreadsheets
     .map((s) => String(s.table ?? ""))
@@ -109,7 +96,13 @@ export async function execSearchSpreadsheets(args: { query: string }) {
     }
   }
 
-  return { spreadsheets, sampleRows };
+  return {
+    ...(docsRes.error ? { documentsError: docsRes.error.message } : {}),
+    ...(sheetsRes.error ? { spreadsheetsError: sheetsRes.error.message } : {}),
+    documents,
+    spreadsheets,
+    sampleRows,
+  };
 }
 
 export async function execQuerySpreadsheetSql(args: { sqlQuery: string }) {
@@ -176,22 +169,14 @@ export async function execListDriveFiles(args: { nameQuery?: string }) {
 
 export function createAssistantTools() {
   return {
-    searchDocuments: tool({
-      description: "Search indexed PDFs, scanned OCR pages, and Word docs.",
+    searchKnowledge: tool({
+      description:
+        "Search ALL indexed Google Drive knowledge in parallel: PDFs, scanned OCR pages, Word docs, narrative Excel sheets, AND spreadsheet SQL table catalogs.",
       parameters: z.object({
         query: z.string(),
         fileType: z.string().optional(),
       }),
-      execute: execSearchDocuments,
-    }),
-
-    searchSpreadsheets: tool({
-      description:
-        "Find Excel sheets, SQL table names, columns, and sample rows by topic or filename.",
-      parameters: z.object({
-        query: z.string(),
-      }),
-      execute: execSearchSpreadsheets,
+      execute: execSearchKnowledge,
     }),
 
     querySpreadsheetSql: tool({

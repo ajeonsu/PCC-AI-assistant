@@ -21,8 +21,9 @@ from app.db.postgres import (
     update_file_metadata_only,
     upsert_file_registry,
 )
+from app.parsers.chunker import DocumentChunk
 from app.parsers.documents import parse_docx_bytes, parse_pdf_bytes, parse_text_bytes
-from app.parsers.excel import parse_spreadsheet_bytes
+from app.parsers.excel import parse_spreadsheet_bytes, sheet_to_document_chunks
 from app.sync.drive_client import DriveClient, DriveFileRecord, FOLDER_MIME_TYPE
 
 MIME_GOOGLE_DOC = "application/vnd.google-apps.document"
@@ -164,9 +165,27 @@ def _ingest_single_file(
             embeddings = gemini.embed_texts(
                 [s.summary_text for s in sheets], task_type="RETRIEVAL_DOCUMENT"
             )
+            narrative_chunks: list[DocumentChunk] = []
             for sheet, emb in zip(sheets, embeddings):
                 load_excel_sheet(conn, sheet, rec, emb)
                 tables_added += 1
+                if sheet.row_count <= 100:
+                    narrative_chunks.extend(
+                        sheet_to_document_chunks(
+                            sheet,
+                            rec.file_name,
+                            start_index=len(narrative_chunks),
+                        )
+                    )
+
+            if narrative_chunks:
+                chunk_embeddings = gemini.embed_texts(
+                    [c.content for c in narrative_chunks],
+                    task_type="RETRIEVAL_DOCUMENT",
+                )
+                chunks_added = insert_document_chunks(
+                    conn, rec, narrative_chunks, chunk_embeddings
+                )
 
     upsert_file_registry(conn, rec, "indexed")
     console.print(
@@ -209,7 +228,7 @@ def run_sync(
             existing = registry.get(rec.file_id)
             if existing is None:
                 action = "add"
-            elif _content_changed(existing, rec):
+            elif target_file_id is not None or _content_changed(existing, rec):
                 action = "update"
             elif _metadata_changed(existing, rec):
                 action = "metadata"

@@ -82,12 +82,20 @@ create table if not exists public.spreadsheet_catalog (
     sample_rows_json jsonb not null default '[]'::jsonb,
     summary_text text not null default '',
     embedding halfvec(768),
+    tsv tsvector generated always as (
+        to_tsvector(
+            'english',
+            coalesce(file_name, '') || ' ' || coalesce(sheet_name, '') || ' ' || coalesce(summary_text, '')
+        )
+    ) stored,
     web_view_link text,
     updated_at timestamptz default now()
 );
 
 create index if not exists idx_spreadsheet_catalog_file_id
     on public.spreadsheet_catalog (file_id);
+create index if not exists idx_spreadsheet_catalog_tsv
+    on public.spreadsheet_catalog using gin (tsv);
 create index if not exists idx_spreadsheet_catalog_embedding_hnsw
     on public.spreadsheet_catalog using hnsw (embedding halfvec_cosine_ops);
 
@@ -189,7 +197,7 @@ $$;
 create or replace function public.search_spreadsheets(
     query_text text,
     query_embedding halfvec(768),
-    match_count int default 5
+    match_count int default 8
 )
 returns table (
     catalog_id uuid,
@@ -206,37 +214,72 @@ returns table (
 language sql
 stable
 as $$
-select
-    sc.catalog_id,
-    sc.file_id,
-    sc.file_name,
-    sc.sheet_name,
-    sc.sql_table_name,
-    sc.row_count,
-    sc.columns_json,
-    sc.summary_text,
-    sc.web_view_link,
-    (
+with q as (
+    select
         case
-            when query_embedding is not null and sc.embedding is not null
-                then 1.0 - (sc.embedding <=> query_embedding)
-            else 0.0
-        end
-        + case
-            when nullif(trim(query_text), '') is not null
-                 and (
-                     sc.file_name ilike '%' || query_text || '%'
-                     or sc.sheet_name ilike '%' || query_text || '%'
-                     or sc.summary_text ilike '%' || query_text || '%'
-                 )
-                then 0.25
-            else 0.0
-        end
-    ) as score
-from public.spreadsheet_catalog sc
-join public.files_registry fr on fr.file_id = sc.file_id
-where fr.sync_status = 'indexed'
-order by score desc
+            when nullif(plainto_tsquery('english', coalesce(query_text, ''))::text, '') is not null
+                then replace(plainto_tsquery('english', query_text)::text, ' & ', ' | ')::tsquery
+            else null::tsquery
+        end as tsq
+),
+filtered as (
+    select
+        sc.catalog_id,
+        sc.file_id,
+        sc.file_name,
+        sc.sheet_name,
+        sc.sql_table_name,
+        sc.row_count,
+        sc.columns_json,
+        sc.summary_text,
+        sc.web_view_link,
+        sc.embedding,
+        sc.tsv
+    from public.spreadsheet_catalog sc
+    join public.files_registry fr on fr.file_id = sc.file_id
+    where fr.sync_status = 'indexed'
+),
+semantic as (
+    select
+        f.catalog_id,
+        row_number() over (order by f.embedding <=> query_embedding) as rank_ix
+    from filtered f
+    where query_embedding is not null and f.embedding is not null
+    order by f.embedding <=> query_embedding
+    limit greatest(match_count * 4, 25)
+),
+keyword as (
+    select
+        f.catalog_id,
+        row_number() over (order by ts_rank_cd(f.tsv, q.tsq) desc) as rank_ix
+    from filtered f
+    cross join q
+    where q.tsq is not null and f.tsv @@ q.tsq
+    order by ts_rank_cd(f.tsv, q.tsq) desc
+    limit greatest(match_count * 4, 25)
+),
+combined as (
+    select
+        coalesce(s.catalog_id, k.catalog_id) as catalog_id,
+        coalesce(1.0::double precision / (60 + s.rank_ix), 0.0)
+            + coalesce(1.0::double precision / (60 + k.rank_ix), 0.0) as rrf_score
+    from semantic s
+    full outer join keyword k on s.catalog_id = k.catalog_id
+)
+select
+    f.catalog_id,
+    f.file_id,
+    f.file_name,
+    f.sheet_name,
+    f.sql_table_name,
+    f.row_count,
+    f.columns_json,
+    f.summary_text,
+    f.web_view_link,
+    c.rrf_score as score
+from combined c
+join filtered f on f.catalog_id = c.catalog_id
+order by c.rrf_score desc
 limit greatest(match_count, 1);
 $$;
 

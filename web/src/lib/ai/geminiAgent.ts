@@ -2,8 +2,7 @@ import { createDataStreamResponse, formatDataStreamPart } from "ai";
 import {
   execListDriveFiles,
   execQuerySpreadsheetSql,
-  execSearchDocuments,
-  execSearchSpreadsheets,
+  execSearchKnowledge,
 } from "@/lib/ai/tools";
 
 interface ChatMessageInput {
@@ -34,25 +33,14 @@ const GEMINI_TOOLS = [
   {
     functionDeclarations: [
       {
-        name: "searchDocuments",
-        description: "Search indexed PDFs, scanned OCR pages, and Word docs.",
+        name: "searchKnowledge",
+        description:
+          "Search ALL indexed Google Drive knowledge in parallel: PDFs, scanned OCR pages, Word docs, narrative Excel sheets, AND spreadsheet SQL table catalogs.",
         parameters: {
           type: "OBJECT",
           properties: {
             query: { type: "STRING" },
             fileType: { type: "STRING" },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "searchSpreadsheets",
-        description:
-          "Find Excel sheets, SQL table names, columns, and sample rows by topic or filename.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            query: { type: "STRING" },
           },
           required: ["query"],
         },
@@ -88,14 +76,10 @@ async function executeToolByName(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   switch (name) {
-    case "searchDocuments":
-      return await execSearchDocuments({
+    case "searchKnowledge":
+      return await execSearchKnowledge({
         query: String(args.query ?? ""),
         fileType: typeof args.fileType === "string" ? args.fileType : undefined,
-      });
-    case "searchSpreadsheets":
-      return await execSearchSpreadsheets({
-        query: String(args.query ?? ""),
       });
     case "querySpreadsheetSql":
       return await execQuerySpreadsheetSql({
