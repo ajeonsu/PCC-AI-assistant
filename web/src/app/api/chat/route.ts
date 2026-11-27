@@ -1,5 +1,10 @@
 import { streamText } from "ai";
-import { DEFAULT_MODEL_ID, getLanguageModel } from "@/lib/ai/models";
+import { runGeminiDataStreamResponse } from "@/lib/ai/geminiAgent";
+import {
+  DEFAULT_MODEL_ID,
+  getGroqLanguageModel,
+  getModelOption,
+} from "@/lib/ai/models";
 import { SYSTEM_PROMPT } from "@/lib/ai/systemPrompt";
 import { createAssistantTools } from "@/lib/ai/tools";
 import { getAuthorizedUser } from "@/lib/supabase/server";
@@ -21,17 +26,28 @@ export async function POST(request: Request) {
     return Response.json({ error: "Messages are required" }, { status: 400 });
   }
 
-  const model = getLanguageModel(body.modelId ?? DEFAULT_MODEL_ID);
+  const option = getModelOption(body.modelId ?? DEFAULT_MODEL_ID);
+  const recentMessages = body.messages.slice(-6);
+
+  if (option.provider === "google") {
+    return runGeminiDataStreamResponse({
+      modelName: option.modelName,
+      system: SYSTEM_PROMPT,
+      messages: recentMessages as Array<{ role: string; content: unknown }>,
+      maxSteps: 6,
+    });
+  }
+
+  const model = getGroqLanguageModel(option.modelName);
   const tools = createAssistantTools();
-  const recentMessages = body.messages.slice(-8);
 
   const result = streamText({
     model,
     system: SYSTEM_PROMPT,
     messages: recentMessages,
     tools,
-    maxSteps: 6,
-    maxRetries: 1,
+    maxSteps: 5,
+    maxRetries: 3,
     temperature: 0.1,
   });
 
