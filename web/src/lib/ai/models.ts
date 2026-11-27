@@ -12,25 +12,25 @@ export interface ModelOption {
 
 export const MODEL_OPTIONS: ModelOption[] = [
   {
+    id: "gemini-3.8-flash",
+    label: "Gemini 3.8 Flash",
+    provider: "google",
+    modelName: "gemini-3.8-flash",
+    badge: "Free Recommended",
+  },
+  {
     id: "groq-gpt-oss-120b",
     label: "Groq GPT-OSS 120B",
     provider: "groq",
     modelName: "openai/gpt-oss-120b",
-    badge: "Free Fast",
+    badge: "Groq Free",
   },
   {
     id: "groq-qwen-3.8",
     label: "Groq Qwen 3.8 27B",
     provider: "groq",
     modelName: "qwen/qwen3.8-27b",
-    badge: "Free SQL",
-  },
-  {
-    id: "gemini-3.8-flash",
-    label: "Gemini 3.8 Flash",
-    provider: "google",
-    modelName: "gemini-3.8-flash",
-    badge: "Large Context",
+    badge: "Groq SQL",
   },
 ];
 

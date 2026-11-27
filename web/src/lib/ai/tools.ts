@@ -4,6 +4,13 @@ import { embedQuery } from "@/lib/ai/embeddings";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { validateReadOnlyExcelSql } from "@/lib/supabase/sqlGuard";
 
+function truncateText(val: unknown, maxLen: number): unknown {
+  if (typeof val === "string" && val.length > maxLen) {
+    return `${val.slice(0, maxLen)}…`;
+  }
+  return val;
+}
+
 export function createAssistantTools() {
   const supabase = createAdminClient();
 
@@ -25,8 +32,8 @@ export function createAssistantTools() {
           .number()
           .int()
           .min(1)
-          .max(10)
-          .default(6)
+          .max(8)
+          .default(4)
           .describe("Maximum number of document chunks to return"),
       }),
       execute: async ({ query, folderFilter, fileType, topK }) => {
@@ -42,7 +49,13 @@ export function createAssistantTools() {
         if (error) {
           return { error: error.message, results: [] };
         }
-        return { results: data ?? [] };
+        const results = (
+          (data ?? []) as Array<Record<string, unknown>>
+        ).map((row) => ({
+          ...row,
+          content: truncateText(row.content, 1400),
+        }));
+        return { results };
       },
     }),
 
@@ -51,7 +64,7 @@ export function createAssistantTools() {
         "Search the Excel spreadsheet catalog by file name, worksheet name, column names, or topic to find candidate SQL tables.",
       parameters: z.object({
         query: z.string().describe("Topic, file name, sheet name, or column keywords"),
-        topK: z.number().int().min(1).max(10).default(6),
+        topK: z.number().int().min(1).max(8).default(4),
       }),
       execute: async ({ query, topK }) => {
         const queryEmbedding = await embedQuery(query);
@@ -64,13 +77,22 @@ export function createAssistantTools() {
         if (error) {
           return { error: error.message, spreadsheets: [] };
         }
-        return { spreadsheets: data ?? [] };
+        const spreadsheets = (
+          (data ?? []) as Array<Record<string, unknown>>
+        ).map((s) => ({
+          file_name: s.file_name,
+          sheet_name: s.sheet_name,
+          sql_table_name: s.sql_table_name,
+          row_count: s.row_count,
+          web_view_link: s.web_view_link,
+        }));
+        return { spreadsheets };
       },
     }),
 
     describeSpreadsheet: tool({
       description:
-        "Inspect exact SQL column names, PostgreSQL data types, original Excel headers, row count, and 5 sample rows for a spreadsheet table before writing SQL.",
+        "Inspect exact SQL column names, PostgreSQL data types, original Excel headers, row count, and sample rows for a spreadsheet table before writing SQL.",
       parameters: z.object({
         sqlTableName: z
           .string()
@@ -95,7 +117,44 @@ export function createAssistantTools() {
         if (!data) {
           return { error: `Spreadsheet table '${normalized}' not found in catalog.` };
         }
-        return data;
+
+        const cols = Array.isArray(data.columns_json)
+          ? (
+              data.columns_json as Array<{
+                name?: string;
+                pg_type?: string;
+                original_header?: string;
+              }>
+            ).map((c) => {
+              const name = c.name ?? "";
+              const pgType = c.pg_type ?? "TEXT";
+              const orig = c.original_header ?? "";
+              const normOrig = orig.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+              return orig && normOrig !== name
+                ? `${name} (${pgType}; header="${orig}")`
+                : `${name} (${pgType})`;
+            })
+          : [];
+
+        const sampleRows = Array.isArray(data.sample_rows_json)
+          ? (data.sample_rows_json as Array<Record<string, unknown>>)
+              .slice(0, 2)
+              .map((row) =>
+                Object.fromEntries(
+                  Object.entries(row).map(([k, v]) => [k, truncateText(v, 80)]),
+                ),
+              )
+          : [];
+
+        return {
+          file_name: data.file_name,
+          sheet_name: data.sheet_name,
+          sql_table_name: data.sql_table_name,
+          row_count: data.row_count,
+          columns: cols,
+          sample_rows: sampleRows,
+          web_view_link: data.web_view_link,
+        };
       },
     }),
 
@@ -106,7 +165,7 @@ export function createAssistantTools() {
         sqlQuery: z
           .string()
           .describe("Single read-only PostgreSQL SELECT or WITH query targeting excel_data.*"),
-        maxRows: z.number().int().min(1).max(200).default(100),
+        maxRows: z.number().int().min(1).max(200).default(50),
       }),
       execute: async ({ sqlQuery, maxRows }) => {
         let cleanedSql: string;
