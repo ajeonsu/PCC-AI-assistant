@@ -188,18 +188,15 @@ Stores parsed text chunks for PDFs, Word files, and exported Google Docs.
 
 ## 8. Agent Tools & Query Pipeline (TypeScript + Vercel AI SDK)
 
-The Next.js `/api/chat` route exposes five compact tools to the LLM:
+The Next.js `/api/chat` route (`https://pcc-ai-assistant.vercel.app`) uses a native **Gemini 3.1 Flash Lite** tool-calling runner (`geminiAgent.ts`, preserving `thoughtSignature`) as default alongside **Groq** (`openai/gpt-oss-120b`, `qwen/qwen3.8-27b`), exposing three unified tools:
 
-1. `searchDocuments({ query, folderFilter?, fileType?, topK = 6 })`
-   - Calls `hybrid_search_documents` RPC in Supabase and returns ranked text excerpts, `file_name`, `page_number`, and `web_view_link`.
-2. `searchSpreadsheets({ query, topK = 5 })`
-   - Calls `search_spreadsheets` RPC in Supabase to locate relevant Excel sheets.
-3. `describeSpreadsheet({ sqlTableName })`
-   - Fetches exact `columns_json`, `row_count`, and `sample_rows_json` from `public.spreadsheet_catalog`.
-4. `querySpreadsheetSql({ sqlQuery })`
-   - Validates SQL guardrails in TypeScript -> executes `run_readonly_excel_sql` RPC -> returns JSON rows.
-5. `listDriveFiles({ nameQuery?, folderPath?, fileType?, limit = 30 })`
-   - Queries `public.files_registry` directly for inventory/freshness questions (*"Which Excel masterlists are in Drive?"*).
+1. `searchKnowledge({ query, fileType? })`
+   - Embeds `query` once and searches **in parallel** across `public.document_chunks` (`hybrid_search_documents`) **and** `public.spreadsheet_catalog` (`search_spreadsheets` with `tsvector` + `halfvec` RRF, diversified to max 2 sheets per file / 6 files total, plus top sample rows).
+   - Ensures PDFs, scanned OCR pages, Word documents, narrative Excel sheets (`<= 100` rows dual-indexed into `document_chunks`), and multi-thousand-row Excel schemas are all found without asking the user to specify a file name.
+2. `querySpreadsheetSql({ sqlQuery })`
+   - Validates SQL guardrails in TypeScript -> executes `run_readonly_excel_sql` RPC -> returns JSON rows (`max_rows = 50`).
+3. `listDriveFiles({ nameQuery? })`
+   - Queries `public.files_registry` directly for file-inventory or freshness questions.
 
 ### Grounding & Citation Rules
 - Every factual claim or calculation must cite the exact **file name**, **page number** (PDF) or **sheet name** (Excel), and clickable **`webViewLink`**.
@@ -207,33 +204,83 @@ The Next.js `/api/chat` route exposes five compact tools to the LLM:
 
 ---
 
-## 9. Proposed Monorepo Structure
+## 9. Phase 4 Plan: Cross-File & 100+ Document Global Aggregation
+
+Standard top-K vector search cannot reliably sum figures across **100+ separate PDF/Word documents** (e.g., *"total budget cost across all 2026 proposals"*) or **dozens of separate Excel files** without risking missed files, context overflow, or double-counting dated snapshots. Phase 4 closes these three gaps systematically before scaling to 100 GB.
+
+### 9.1 Gap A — Multi-Excel Totals & Anti-Double-Counting (2–6 Files, Phase 4A)
+- **Problem:** When 2+ Excel files match a question (e.g., `Excel 1` has carabao count `4` and `Excel 2` has carabao count `8`), an LLM may stop after querying only the top file—or conversely, accidentally double-count dated snapshots of the same workbook (e.g., `sbfp_sdo_masterlist_2026_2026-10-27.xlsx` vs. `2026-11-10.xlsx`).
+- **Solution (`web/src/lib/ai/systemPrompt.ts`):**
+  1. Require the AI to inspect and query **all** matching non-duplicate tables returned by `searchKnowledge.spreadsheets` (via `UNION ALL` or sequential `querySpreadsheetSql` calls).
+  2. Always display a **per-file breakdown** with file names, modified dates, and clickable Drive links.
+  3. **Sum** values when the matched files represent separate/complementary datasets (e.g., Region A + Region B, Batch 1 + Batch 2: `4 + 8 = 12`).
+  4. **Use the latest file and warn the user (do not double-count)** when matched files are clearly dated snapshots/revisions of the same report.
+
+### 9.2 Gap B — Global Totals Across 100–10,000 PDFs & Word Docs (Phase 4B — Structured Document Extractor)
+- **Problem:** Asking *"What is the total approved budget across all 100 PDFs/Word docs?"* cannot be answered by retrieving top 5 chunks at chat time.
+- **Solution (Sync-Time Extraction -> SQL):**
+  1. **Migration `supabase/migrations/005_extracted_documents.sql`:**
+     - `excel_data.extracted_documents`:
+       - `file_id text primary key references public.files_registry(file_id) on delete cascade`
+       - `file_name text`, `folder_path text`, `doc_type text` (`proposal`, `briefer`, `minutes`, `memo`, `po`, `report`, `other`)
+       - `title text`, `doc_date date`, `year int`, `program text` (`SBFP`, `MFP`, `CBED`, `PMC`, etc.), `center_or_region text`
+       - `total_budget_php numeric(18,2)`, `currency text default 'PHP'`, `beneficiaries_count int`, `carabao_count int`, `milk_packs_count bigint`
+       - `summary text`, `extraction_confidence text`, `web_view_link text`, `extracted_at timestamptz default now()`
+     - `excel_data.document_budget_items` (line-item breakdown for budgets/annexes like *Annex B* in `90th-PMC-MEETING-APPROVED.pdf`):
+       - `item_id uuid primary key default gen_random_uuid()`, `file_id text references public.files_registry(file_id) on delete cascade`, `category text`, `description text`, `quantity text`, `unit_cost numeric(18,2)`, `line_total_php numeric(18,2)`
+     - Grant `SELECT` on both tables to `authenticated, service_role` and register a summary row in `public.spreadsheet_catalog` so `searchKnowledge` discovers `excel_data.extracted_documents` automatically.
+  2. **Python Extractor (`worker/app/parsers/extractor.py`):**
+     - Runs once per PDF, Word doc, or narrative Excel tab during Add/Edit sync using `gemini-3.1-flash-lite` structured JSON output (`response_mime_type="application/json"`).
+     - `ON DELETE CASCADE` + `purge_file_artifacts` ensures edits replace extracted numbers cleanly and Drive deletions subtract them from global totals immediately.
+  3. **Chat-Time Execution:**
+     - Asking *"Total approved budget across all 2026 documents?"* triggers one instant SQL query on `excel_data.extracted_documents` (`SELECT COUNT(*) AS doc_count, SUM(total_budget_php) AS total_php FROM excel_data.extracted_documents WHERE year = 2026`), returning exact peso totals across 100 or 10,000 documents in ~2 seconds with file-level citations.
+
+### 9.3 Gap C — Grand Totals Across 20–200+ Similar Excel Workbooks (Phase 4C — Consolidated SQL Views)
+- **Problem:** At 100 GB, if 50–200 separate regional or monthly Excel files share the same column layout, querying them individually exceeds LLM tool-step limits.
+- **Solution (Schema-Fingerprint Consolidation in Python Sync):**
+  - Compute a normalized column-signature hash per parsed sheet in `worker/app/parsers/excel.py`.
+  - When 2+ files share the same schema group (or live in a configured consolidation group), automatically create/refresh a PostgreSQL `VIEW` (`excel_data.all_<group_name>`) combining them via `UNION ALL` with metadata columns (`_source_file`, `_source_sheet`, `_modified_time`, `_is_latest_version`) and register the consolidated view in `public.spreadsheet_catalog`.
+  - Enables a single `SELECT SUM(...) GROUP BY ...` across 100+ workbooks while avoiding double-counting older snapshots via `_is_latest_version = true`.
+
+### 9.4 Phase 4 Acceptance & Verification Tests
+1. **Multi-Excel Sum:** Upload two complementary test Excel files (`carabao_count = 4` and `carabao_count = 8` for 2026) -> verify AI shows both files and sums to `12`.
+2. **Anti-Double-Counting:** Ask a 2026 SDO masterlist total across `sbfp_sdo_masterlist_2026_2026-10-27.xlsx` and `2026-11-10.xlsx` -> verify AI uses the latest (`2026-11-10`) and warns instead of summing both snapshots.
+3. **100-Doc Style Global Aggregation:** Populate `excel_data.extracted_documents` across all pilot PDFs/Word docs (e.g., `90th-PMC-MEETING-APPROVED.pdf` ₱500,000.00 + any additional test proposals) -> verify SQL `SUM(total_budget_php)` matches the exact ground truth and updates immediately after an Add, Edit, and Delete sync cycle.
+
+---
+
+## 10. Current Monorepo Structure
 
 ```text
 ai-assistant/
 ├── web/                              # Next.js (TypeScript) Chat UI + API on Vercel Free
 │   ├── src/app/
-│   │   ├── api/chat/route.ts         # Vercel AI SDK streaming agent + 5 Supabase tools
+│   │   ├── api/chat/route.ts         # Streaming agent router (Gemini 3.1 Flash Lite + Groq)
+│   │   ├── api/knowledge/route.ts    # Indexed files & stats API
 │   │   ├── login/page.tsx            # Single-user Supabase Auth login
-│   │   └── page.tsx                  # Chat interface with citation links & model switcher
+│   │   └── page.tsx                  # Authenticated chat workspace
 │   ├── src/lib/
-│   │   ├── supabase/                 # SSR client, service-role/user queries, SQL validator
-│   │   └── ai/                       # Provider registry (Groq, Gemini, Claude) + tool schemas
+│   │   ├── supabase/                 # SSR auth, admin client, SQL AST guardrail
+│   │   └── ai/                       # geminiAgent.ts, models.ts, embeddings.ts, tools.ts (3 unified tools)
 │   └── package.json
 ├── worker/                           # Python 3.11+ (uv) Drive Sync & Heavy Ingestion
 │   ├── app/
-│   │   ├── sync/                     # Personal Drive OAuth2, crawler, changes.list handler
-│   │   ├── parsers/                  # PyMuPDF + Gemini Flash OCR, python-docx, calamine Excel loader
+│   │   ├── ai/                       # gemini_client.py (gemini-embedding-001 + 3.8-flash OCR)
+│   │   ├── sync/                     # Personal Drive OAuth2, crawler, changes.list pipeline
+│   │   ├── parsers/                  # PyMuPDF + OCR, python-docx, calamine Excel loader (+ Phase 4B extractor.py)
 │   │   ├── db/                       # psycopg Postgres + pgvector halfvec + COPY Excel loader
-│   │   └── core/                     # Config, retry/backoff, dead-letter logging
+│   │   └── core/                     # Config, retry/backoff
 │   ├── scripts/
-│   │   ├── audit_drive.py            # Phase 0 read-only inventory (counts, sizes, PDF scan ratio)
-│   │   ├── sync_once.py              # Run initial crawl or incremental sync on demand
-│   │   └── watch_drive.py            # Scheduled polling loop for continuous sync
+│   │   ├── audit_drive.py            # Phase 0 read-only inventory & PDF scan sampler
+│   │   ├── sync_once.py              # Initial crawl or incremental sync CLI
+│   │   └── watch_drive.py            # Scheduled polling loop
 │   └── pyproject.toml
 ├── supabase/
 │   └── migrations/
-│       └── 001_initial_schema.sql    # pgvector halfvec(768), excel_data schema, RRF & readonly SQL RPCs
+│       ├── 001_initial_schema.sql    # halfvec(768), excel_data schema, RRF & readonly SQL RPCs
+│       ├── 002_fix_readonly_sql_regex.sql
+│       ├── 003_grant_service_role_permissions.sql
+│       └── 004_hybrid_spreadsheet_search.sql
 ├── .env.example
 ├── README.md
 └── rag_system_plan.md
@@ -241,53 +288,49 @@ ai-assistant/
 
 ---
 
-## 10. Phased Implementation Roadmap (Free Pilot First)
+## 11. Phased Implementation Roadmap
 
 ### Phase 0: Drive Audit & Pilot Selection *(Completed)*
 - Configured Google Cloud OAuth2 (`pcc-ai-assistant`) and ran `worker/scripts/audit_drive.py` against `PCC-AI assistant` (`1SbPhaMya35mjychLtbxI1RTqSLZmbesu`).
-- Audited 9 pilot files (12.32 MB total: 5 Excel, 2 Word, 2 PDF) and detected that `90th-PMC-MEETING-APPROVED.pdf` (7 pages) is 100% scanned images (`87.5%` scanned pages overall), confirming OCR support is mandatory.
+- Audited 9 pilot files (12.32 MB total: 5 Excel, 2 Word, 2 PDF) and detected `90th-PMC-MEETING-APPROVED.pdf` is 100% scanned images (`87.5%` scanned pages overall).
 
-### Phase 1: Supabase Schema & Personal Drive Sync Foundation
-- Create the free **Supabase** project and apply `001_initial_schema.sql` (`pgvector` `halfvec(768)`, `excel_data` schema, tables, RRF search RPC, read-only SQL RPC).
-- Implement `sync_once.py` with `files_registry` tracking and `changes.list` incremental checkpointing.
+### Phase 1 & 2: Supabase Schema, Drive Sync & Hybrid Parsers *(Completed)*
+- Applied migrations `001`–`004` (`halfvec(768)`, `excel_data` schema, PostgREST `service_role` grants, `spreadsheet_catalog` `tsvector` RRF search).
+- Implemented `sync_once.py` / `watch_drive.py`, `gemini-3.8-flash` multimodal OCR, `.docx` parser, `python-calamine` Excel-to-SQL loader, and dual-indexing for small/narrative sheets (`<= 100` rows).
+- Indexed all 9 pilot files (`45` SQL tables + document/narrative chunks; `15 MB` total Supabase DB size).
 
-### Phase 2: Python Parsers & Add/Edit/Delete Verification
-- Build PDF parsing (`PyMuPDF` for digital text + **Gemini 2.5 Flash multimodal OCR** for scanned pages `< 30` chars) and Word parsing (`python-docx`) with `gemini-embedding-001` (`768-dim` stored as `halfvec(768)`).
-- Build `python-calamine` Excel loader into `excel_data.xl_*` + `spreadsheet_catalog`.
-- Test **Add**, **Edit**, and **Delete** directly in your pilot Google Drive folder and verify Supabase updates/purges cleanly with zero orphaned chunks or tables.
+### Phase 3: Next.js Chat App, Unified `searchKnowledge` & Vercel Deploy *(Completed)*
+- Deployed `web/` to **https://pcc-ai-assistant.vercel.app** with single-user Supabase Auth (`ajeonicpsycho@gmail.com`).
+- Implemented unified `searchKnowledge` (parallel Docs + Excel search), `querySpreadsheetSql`, and native **Gemini 3.1 Flash Lite** tool calling (`thoughtSignature` preserved).
 
-### Phase 3: Next.js TypeScript Chat App + Vercel AI SDK (Groq & Gemini Free)
-- Scaffold `web/` with Next.js + TypeScript + Supabase Auth (locked to `ajeonicpsycho@gmail.com`).
-- Implement `/api/chat` with the 5 tools, TypeScript SQL guardrail, clickable Drive citations, and a model toggle (**Groq Free** default + **Gemini 2.5 Flash Free** fallback).
-- Deploy `web/` to **Vercel Hobby (Free)** and switch Google OAuth Consent Screen to **In Production** using the Vercel URL.
-
-### Phase 4: Pilot Evaluation & Model Tuning
-- Run 30–50 real test questions against your pilot folder (scanned PDF Q&A, exact `SUM`/`GROUP BY` on Excel files, post-edit/post-delete accuracy).
-- Benchmark Groq free tier vs. Gemini 2.5 Flash and decide whether to stay free or enable cheap/flagship models.
+### Phase 4: Cross-File & 100+ Document Global Aggregation *(Next)*
+- **4A:** Multi-Excel breakdown + anti-double-counting prompt rules.
+- **4B:** Structured Document Extractor (`005_extracted_documents.sql` + `worker/app/parsers/extractor.py`) for exact SQL totals across 100–10,000 PDFs/Word docs.
+- **4C:** Schema-fingerprint Consolidated SQL Views for 20–200+ matching Excel workbooks, plus Add/Edit/Delete and accuracy verification tests.
 
 ### Phase 5: 100 GB Scale-Up
 - Run `audit_drive.py` on the full 100 GB folder to confirm exact Supabase storage needed (with `halfvec(768)` keeping vector storage minimal).
-- Upgrade `DATABASE_URL` (Supabase Pro or \$10–\$20/mo Postgres VPS), run resumable parallel ingestion, and run `watch_drive.py` continuously.
+- Upgrade `DATABASE_URL` (Supabase Pro or \$10–\$20/mo Postgres VPS), run resumable parallel ingestion, switch Google OAuth Consent Screen to **In Production** using the Vercel URL, and run `watch_drive.py` continuously.
 
 ---
 
-## 11. Key Risks, Free-Tier Limits & Mitigations
+## 12. Key Risks, Free-Tier Limits & Mitigations
 
 | Risk / Limit | Impact | Mitigation |
 | :--- | :--- | :--- |
 | **Supabase Free 500 MB DB Limit & 7-Day Pause** | Fits the ~1 GB pilot subset, **not** full 100 GB; inactive DB pauses after 7 days | Raw Drive files stay in Drive; use **`halfvec(768)`** to cut vector + HNSW index storage by **~50%**; swap `DATABASE_URL` to Supabase Pro or \$10–\$20/mo VPS Postgres for 100 GB. |
 | **Vercel Serverless Timeouts (10s–60s)** | Long PDF OCR or 100 GB Drive downloads fail on Vercel | Keep **100% of Drive sync and file parsing in Python** outside Vercel; Vercel only runs fast chat/RPC calls. |
-| **Groq Free Tier TPM / RPM Limits** | Large retrieved chunks or huge schemas trigger `429 Rate Limit` errors | Keep `topK <= 6`, chunk size ~500 tokens, and offer a one-click **Gemini 2.5 Flash Free** fallback in the UI. |
-| **Personal OAuth 7-Day Token Expiry** | Google OAuth apps in "Testing" mode expire refresh tokens every 7 days | Add Vercel Homepage/Privacy URLs in Phase 3 and switch Google Auth Platform to **"In Production"** (private to your account). |
-| **Scanned PDFs (Confirmed in Phase 0)** | Text-only PDF extractors return empty strings on image scans (`90th-PMC-MEETING-APPROVED.pdf`) | Detect pages with `< 30` chars via `PyMuPDF`; run **Gemini 2.5 Flash OCR** during pilot (or local GPU `Docling` for 100 GB bulk runs). |
+| **Groq Free Tier TPM / RPM Limits** | Multi-step tool calls hit Groq's 8,000 TPM cap (`429 Rate Limit`) | Default to native **Gemini 3.1 Flash Lite** (`geminiAgent.ts` with `thoughtSignature`), keeping Groq models selectable for quick queries. |
+| **Personal OAuth 7-Day Token Expiry** | Google OAuth apps in "Testing" mode expire refresh tokens every 7 days | Add Vercel Homepage/Privacy URLs and switch Google Auth Platform to **"In Production"** (private to your account). |
+| **Scanned PDFs (Confirmed in Phase 0)** | Text-only PDF extractors return empty strings on image scans (`90th-PMC-MEETING-APPROVED.pdf`) | Detect pages with `< 30` chars via `PyMuPDF`; run **Gemini 3.8 Flash OCR** during pilot (or local GPU `Docling` for 100 GB bulk runs). |
 | **Messy 5,000-Row Excel Formatting** | Title banners, merged headers, or `$1,200.50` strings break SQL math | Scan top 15 rows for true headers, sanitize column names, and clean numeric/date types in Python before `COPY`. |
 
 ---
 
-## 12. Locked-In Decisions
+## 13. Locked-In Decisions
 
-1. **Data Privacy:** Cloud LLM APIs (**Groq**, **Gemini**, **Claude**) are approved for processing document excerpts and spreadsheet query results.
+1. **Data Privacy:** Cloud LLM APIs (**Gemini**, **Groq**, **Claude**) are approved for processing document excerpts and spreadsheet query results.
 2. **Drive Account Type:** **Personal Google Drive** (`ajeonicpsycho@gmail.com`) connected via **OAuth 2.0** (`drive.readonly` + `changes.list`).
-3. **Architecture & Hosting:** **Next.js (TypeScript) + Vercel AI SDK** on **Vercel Free** + **Supabase PostgreSQL (`pgvector` `halfvec(768)` + `excel_data`)** + **Python sync/parsing worker** (local PC for pilot; VPS/upgraded Postgres for 100 GB scale).
+3. **Architecture & Hosting:** **Next.js (TypeScript) + Vercel AI SDK** on **Vercel Free** (`https://pcc-ai-assistant.vercel.app`) + **Supabase PostgreSQL (`pgvector` `halfvec(768)` + `excel_data`)** + **Python sync/parsing worker** (local PC for pilot; VPS/upgraded Postgres for 100 GB scale).
 4. **Access Scope:** **Single-user** (`ajeonicpsycho@gmail.com` via Supabase Auth, querying the entire folder).
-5. **Budget & LLM Strategy:** Start at **\$0/mo** with **Groq Free Tier + Gemini 2.5 Flash Free** on the pilot; evaluate cheap/flagship models and storage scaling once pilot accuracy is proven.
+5. **Budget & LLM Strategy:** Start at **\$0/mo** with **Gemini 3.1 Flash Lite + Gemini 3.8 Flash OCR + Groq Free Tier** on the pilot; evaluate cheap/flagship models and storage scaling once pilot accuracy is proven.
